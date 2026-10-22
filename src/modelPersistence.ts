@@ -3,17 +3,25 @@ const LOCK_PREFIX = 'local-ai-model-lock-v1:'
 
 export type ModelRecord = { modelId: string; artifactUrl?: string; artifactVersion?: string; runtimeVersion: string; integrity?: string; validation?: string; status: 'downloaded' | 'verified' | 'ready' | 'missing' | 'error'; verifiedAt?: number; updatedAt: number; error?: string }
 export const MODEL_CACHE_CHECK_TIMEOUT_MS = 90_000
+export const MODEL_LOCK_TIMEOUT_MS = 45_000
 export class ModelCacheCheckError extends Error {
   constructor(message: string, readonly code: 'timeout' | 'worker' | 'aborted') { super(message); this.name = 'ModelCacheCheckError' }
 }
+export class ModelLockTimeoutError extends Error {
+  readonly code = 'lock-timeout'
+  constructor(modelId: string, timeoutMs: number) {
+    super(`Another tab may still be preparing ${modelId}. The lock was not acquired within ${Math.round(timeoutMs / 1000)} seconds. Retry after that tab finishes or closes.`)
+    this.name = 'ModelLockTimeoutError'
+  }
+}
 export async function checkModelCache(
   modelId: string,
-  options: { timeoutMs?: number; signal?: AbortSignal } = {},
+  options: { timeoutMs?: number; signal?: AbortSignal; operationId?: string } = {},
 ): Promise<{ cached: boolean; runtimeVersion: string; durationMs: number }> {
   const startedAt = performance.now()
   const timeoutMs = options.timeoutMs ?? MODEL_CACHE_CHECK_TIMEOUT_MS
   const requestId = crypto.randomUUID()
-  const diagnostic = (event: string, details: Record<string, unknown> = {}) => console.info('[LOCAL:model]', { event, modelId, elapsedMs: Math.round(performance.now() - startedAt), ...details })
+  const diagnostic = (event: string, details: Record<string, unknown> = {}) => console.info('[LOCAL:model]', { timestamp: new Date().toISOString(), operationId: options.operationId || requestId, event, modelId, elapsedMs: Math.round(performance.now() - startedAt), ...details })
   if (options.signal?.aborted) throw new ModelCacheCheckError('Model cache check was cancelled.', 'aborted')
   diagnostic('cache-check-start', { timeoutMs })
   return new Promise((resolve, reject) => {
@@ -75,14 +83,68 @@ export function writeModelRecord(record: ModelRecord): boolean {
   catch { return false }
 }
 
-const pause = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms))
-export async function withModelLock<T>(modelId: string, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+const pause = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+  if (signal?.aborted) { reject(signal.reason || new DOMException('Operation aborted.', 'AbortError')); return }
+  const timer = window.setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, ms)
+  const abort = () => { window.clearTimeout(timer); signal?.removeEventListener('abort', abort); reject(signal?.reason || new DOMException('Operation aborted.', 'AbortError')) }
+  signal?.addEventListener('abort', abort, { once: true })
+})
+export async function withModelLock<T>(
+  modelId: string,
+  operation: () => Promise<T>,
+  signal?: AbortSignal,
+  options: { timeoutMs?: number; operationId?: string; onWaiting?: () => void } = {},
+): Promise<T> {
   const lockName = `${LOCK_PREFIX}${modelId}`
+  const timeoutMs = options.timeoutMs ?? MODEL_LOCK_TIMEOUT_MS
+  const startedAt = performance.now()
+  const log = (event: string, details: Record<string, unknown> = {}) => console.info('[LOCAL:model]', { timestamp: new Date().toISOString(), operationId: options.operationId || 'unassigned', event, modelId, elapsedMs: Math.round(performance.now() - startedAt), ...details })
   if (signal?.aborted) throw new DOMException('Operation aborted.', 'AbortError')
-  if (navigator.locks) return navigator.locks.request(lockName, { mode: 'exclusive', signal }, operation)
+  log('lock-requested', { lockName, timeoutMs, api: navigator.locks ? 'web-locks' : 'local-storage-lease' })
+  if (navigator.locks) {
+    const requestController = new AbortController()
+    let acquired = false
+    let timedOut = false
+    const externalAbort = () => requestController.abort(signal?.reason || new DOMException('Operation aborted.', 'AbortError'))
+    signal?.addEventListener('abort', externalAbort, { once: true })
+    const timeout = window.setTimeout(() => {
+      if (acquired) return
+      timedOut = true
+      requestController.abort(new ModelLockTimeoutError(modelId, timeoutMs))
+    }, timeoutMs)
+    options.onWaiting?.()
+    if (typeof navigator.locks.query === 'function') {
+      void navigator.locks.query().then((state) => log('lock-state', {
+        held: state.held?.filter((lock) => lock.name === lockName).length || 0,
+        pending: state.pending?.filter((lock) => lock.name === lockName).length || 0,
+      })).catch((error: unknown) => log('lock-state-unavailable', { error: error instanceof Error ? error.message : String(error) }))
+    }
+    try {
+      return await navigator.locks.request(lockName, { mode: 'exclusive', signal: requestController.signal }, async (lock) => {
+        if (requestController.signal.aborted) {
+          if (timedOut) throw new ModelLockTimeoutError(modelId, timeoutMs)
+          throw requestController.signal.reason || new DOMException('Operation aborted.', 'AbortError')
+        }
+        acquired = true
+        window.clearTimeout(timeout)
+        log('lock-acquired', { lockName, lockMode: lock?.mode })
+        if (signal?.aborted) throw signal.reason || new DOMException('Operation aborted.', 'AbortError')
+        return operation()
+      })
+    } catch (error) {
+      if (timedOut && !acquired) throw new ModelLockTimeoutError(modelId, timeoutMs)
+      if (signal?.aborted) throw signal.reason || new DOMException('Operation aborted.', 'AbortError')
+      throw error
+    } finally {
+      window.clearTimeout(timeout)
+      signal?.removeEventListener('abort', externalAbort)
+      log('lock-released', { acquired })
+    }
+  }
   const key = `local-ai-lease:${modelId}`
   const owner = crypto.randomUUID()
-  const deadline = Date.now() + 120_000
+  const deadline = Date.now() + timeoutMs
+  options.onWaiting?.()
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new DOMException('Operation aborted.', 'AbortError')
     try {
@@ -92,11 +154,12 @@ export async function withModelLock<T>(modelId: string, operation: () => Promise
         const claimed = JSON.parse(localStorage.getItem(key) || 'null') as { owner?: string } | null
         if (claimed?.owner === owner) break
       }
-    } catch { return operation() }
-    await pause(250)
+    } catch { throw new Error('Browser storage is unavailable, so LOCAL cannot safely coordinate model initialization across tabs. Enable site storage, then retry.') }
+    await pause(250, signal)
   }
   if (signal?.aborted) throw new DOMException('Operation aborted.', 'AbortError')
-  if (Date.now() >= deadline) throw new Error('Another tab is currently preparing this model. Close that tab and retry.')
+  if (Date.now() >= deadline) throw new ModelLockTimeoutError(modelId, timeoutMs)
+  log('lock-acquired', { lockName, api: 'local-storage-lease' })
   const heartbeat = window.setInterval(() => {
     try { const current = JSON.parse(localStorage.getItem(key) || 'null') as { owner?: string } | null; if (current?.owner === owner) localStorage.setItem(key, JSON.stringify({ owner, expiresAt: Date.now() + 30_000 })) } catch { /* storage may be unavailable */ }
   }, 5_000)
@@ -104,5 +167,6 @@ export async function withModelLock<T>(modelId: string, operation: () => Promise
   finally {
     window.clearInterval(heartbeat)
     try { const current = JSON.parse(localStorage.getItem(key) || 'null') as { owner?: string } | null; if (current?.owner === owner) localStorage.removeItem(key) } catch { /* storage may be unavailable */ }
+    log('lock-released', { lockName, api: 'local-storage-lease' })
   }
 }

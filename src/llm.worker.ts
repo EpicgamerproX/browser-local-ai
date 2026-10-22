@@ -13,3 +13,4 @@ self.onmessage = (event: MessageEvent) => {
   }
   handler.onmessage(event)
 }
+self.postMessage({ kind: 'initProgressCallback', uuid: '', content: { progress: 0, timeElapsed: 0, text: 'Model worker ready' } })
