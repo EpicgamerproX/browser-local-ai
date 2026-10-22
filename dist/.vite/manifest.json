@@ -4,7 +4,7 @@
     "name": "react"
   },
   "index.html": {
-    "file": "assets/index-MEhU-OqZ.js",
+    "file": "assets/index-JWb7kiNo.js",
     "name": "index",
     "src": "index.html",
     "isEntry": true,
@@ -12,7 +12,6 @@
       "_react-C8w-UNLI.js"
     ],
     "dynamicImports": [
-      "node_modules/@mlc-ai/web-llm/lib/index.js",
       "node_modules/@mlc-ai/web-llm/lib/index.js",
       "node_modules/@mlc-ai/web-llm/lib/index.js"
     ],

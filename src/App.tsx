@@ -13,6 +13,7 @@ type ActiveOperation = { cancelled: boolean; controller: AbortController; cancel
 const MODEL_ID = 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC'
 const STORAGE_KEY = 'local-ai-chat-v1'
 const MODEL_STORAGE_KEY = 'local-ai-model-v1'
+const MODEL_INITIALIZATION_TIMEOUT_MS = 30 * 60_000
 const MODELS = [
   { id: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', name: 'Qwen2.5 0.5B', params: '0.5B', category: 'Desktop / Laptop', profile: 'Lightweight', memory: '~0.95 GB VRAM', recommendation: 'Low memory devices' },
   { id: MODEL_ID, name: 'Qwen2.5 1.5B', params: '1.5B', category: 'Desktop / Laptop', profile: 'Balanced', memory: '~1.63 GB VRAM', recommendation: 'General use' },
@@ -22,6 +23,13 @@ const MODELS = [
   { id: MODEL_ID, name: 'Qwen2.5 1.5B', params: '1.5B', category: 'Mobile', profile: 'Mobile Enhanced', memory: '~1.63 GB VRAM', recommendation: 'Higher-end phone / tablet' },
 ] as const
 const SYSTEM_PROMPT = 'You are Local, a helpful AI assistant running entirely in the user\'s browser. Be clear, accurate, and concise. If uncertain, say so. Do not claim to have used tools, searched the web, or accessed live information unless it was provided in the conversation.'
+
+function withDeadline<T>(promise: Promise<T>, label: string, timeoutMs = MODEL_INITIALIZATION_TIMEOUT_MS): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(`${label} exceeded ${Math.round(timeoutMs / 60_000)} minutes. Stop the operation and retry; if it repeats, choose a smaller model in Models.`)), timeoutMs)
+    promise.then(resolve, reject).finally(() => window.clearTimeout(timer))
+  })
+}
 
 const MessageItem = memo(function MessageItem({ message }: { message: Message }) {
   return <article className={`message ${message.role}`}><div className="message-avatar">{message.role === 'user' ? 'YOU' : <Sparkles size={16}/>}</div><div className="message-body"><div className="message-role">{message.role === 'user' ? 'YOU' : 'LOCAL / AI'}</div><div className="message-content">{message.content}</div></div></article>
@@ -82,34 +90,66 @@ export default function App() {
   const loadedModelRef = useRef('')
   const lifecycleRef = useRef(new Map<string, Promise<MLCEngineInterface>>())
   const activeOperationRef = useRef<ActiveOperation | null>(null)
-  const startupCacheCancelledRef = useRef(false)
   const endRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
 
   useEffect(() => {
     setMetrics((value) => ({ ...value, shellReadyMs: Math.round(performance.now()) }))
     let active = true
-    startupCacheCancelledRef.current = false
-    void Promise.all([...new Set(MODELS.map((model) => model.id))].map(async (id) => [id, await checkModelCache(id)] as const))
-      .then((items) => {
-        if (!active || startupCacheCancelledRef.current) return
-        const available = Object.fromEntries(items.map(([id, result]) => [id, result.cached])) as Record<string, boolean>
-        setCachedModels(available)
-        const records = readModelRecords()
-        const statuses: Record<string, string> = {}
-        for (const [id, result] of items) {
-          const exists = result.cached
-          const old = records[id]
-          if (!exists) { statuses[id] = 'Not downloaded'; if (old?.status === 'verified' || old?.status === 'ready') writeModelRecord({ ...old, status: 'missing', updatedAt: Date.now() }) }
-          else if (old?.runtimeVersion === result.runtimeVersion && (old.status === 'verified' || old.status === 'ready')) statuses[id] = 'Downloaded and runtime-verified ? checking runtime'
-          else { statuses[id] = 'Downloaded - verification needed'; writeModelRecord(modelRecord(id, result.runtimeVersion, 'downloaded')) }
+    const operation = beginOperation()
+    const secondaryChecks = new AbortController()
+    const selectedId = selectedModel
+    const modelIds = [...new Set(MODELS.map((model) => model.id))]
+    const applyCacheResult = (id: string, result: { cached: boolean; runtimeVersion: string }) => {
+      if (!active || operation.cancelled) return
+      setCachedModels((current) => ({ ...current, [id]: result.cached }))
+      const old = readModelRecords()[id]
+      if (!result.cached) {
+        setModelStatuses((current) => ({ ...current, [id]: 'Not downloaded' }))
+        if (old?.status === 'verified' || old?.status === 'ready') writeModelRecord({ ...old, status: 'missing', updatedAt: Date.now() })
+      } else if (old?.runtimeVersion === result.runtimeVersion && (old.status === 'verified' || old.status === 'ready')) {
+        setModelStatuses((current) => ({ ...current, [id]: 'Downloaded and runtime-verified; checking runtime' }))
+      } else {
+        setModelStatuses((current) => ({ ...current, [id]: 'Downloaded; verification needed' }))
+        writeModelRecord(modelRecord(id, result.runtimeVersion, 'downloaded'))
+      }
+    }
+    void (async () => {
+      setBusy(true); setStage('loading'); setStatus('Checking the selected model cache…')
+      setModelLifecycle((current) => ({ ...current, [selectedId]: 'checking-cache' }))
+      try {
+        const selectedCache = await checkModelCache(selectedId, { signal: operation.controller.signal })
+        if (!active || operation.cancelled) return
+        setMetrics((current) => ({ ...current, cacheLookupMs: selectedCache.durationMs }))
+        applyCacheResult(selectedId, selectedCache)
+        if (selectedCache.cached) {
+          await loadModel(selectedId, true, operation, selectedCache)
+        } else {
+          setModelLifecycle((current) => ({ ...current, [selectedId]: 'download-required' }))
+          setStatus('Selected model is not downloaded. Open Models and choose Download & Load.')
+          setError('This model is not cached on this device yet. Choose Download & Load in Models to begin.')
+          setShowModels(true); setStage('error')
         }
-        setModelStatuses(statuses)
-        const selectedExists = Boolean(available[localStorage.getItem(MODEL_STORAGE_KEY) || MODEL_ID])
-        if (selectedExists) void loadModel(localStorage.getItem(MODEL_STORAGE_KEY) || MODEL_ID, true)
-      })
-      .catch(() => { if (active) setCachedModels({}) })
-    return () => { active = false }
+      } catch (cause) {
+        if (active && !operation.cancelled) {
+          const message = cause instanceof Error ? cause.message : 'Could not inspect the selected model cache.'
+          setModelLifecycle((current) => ({ ...current, [selectedId]: 'failed' }))
+          setModelStatuses((current) => ({ ...current, [selectedId]: `Cache check failed: ${message}` }))
+          setError(message); setStatus('Model cache check failed'); setShowModels(true); setStage('error')
+        }
+      } finally {
+        if (active && activeOperationRef.current === operation) { setBusy(false); finishOperation(operation) }
+      }
+      // Secondary model checks run independently after the selected model has settled.
+      for (const id of modelIds) {
+        if (id === selectedId || !active) continue
+        try { applyCacheResult(id, await checkModelCache(id, { signal: secondaryChecks.signal })) }
+        catch (cause) {
+          if (active) setModelStatuses((current) => ({ ...current, [id]: `Cache check failed: ${cause instanceof Error ? cause.message : 'unknown error'}` }))
+        }
+      }
+    })()
+    return () => { active = false; secondaryChecks.abort(); operation.cancel(); finishOperation(operation) }
   }, [])
 
   useEffect(() => {
@@ -144,7 +184,6 @@ export default function App() {
   }
 
   function stopOperations() {
-    startupCacheCancelledRef.current = true
     const operation = activeOperationRef.current
     operation?.cancel()
     if (operation) finishOperation(operation)
@@ -192,7 +231,7 @@ export default function App() {
   }, [projects])
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, stage])
 
-  async function ensureModelLoaded(modelToLoad: string, operationOverride?: ActiveOperation): Promise<MLCEngineInterface> {
+  async function ensureModelLoaded(modelToLoad: string, operationOverride?: ActiveOperation, knownCache?: { cached: boolean; runtimeVersion: string; durationMs?: number }): Promise<MLCEngineInterface> {
     const inFlight = lifecycleRef.current.get(modelToLoad)
     if (inFlight) return inFlight
     const operation = operationOverride || activeOperationRef.current
@@ -206,7 +245,7 @@ export default function App() {
       setModelLifecycle((current) => ({ ...current, [modelToLoad]: 'checking-cache' }))
       setModelStatuses((current) => ({ ...current, [modelToLoad]: 'Checking persistent cache' }))
       setStatus('Checking the local model cache...')
-      const cache = await raceCancellation(checkModelCache(modelToLoad))
+      const cache = knownCache || await raceCancellation(checkModelCache(modelToLoad, { signal: operation?.controller.signal }))
       setMetrics((value) => ({ ...value, cacheLookupMs: performance.now() - cacheStartedAt }))
       if (!cache.cached) setModelLifecycle((current) => ({ ...current, [modelToLoad]: 'download-required' }))
       if (!cache.cached && !navigator.onLine) { setModelLifecycle((current) => ({ ...current, [modelToLoad]: 'recoverable-offline-error' })); throw new Error('This model is not cached and the device is offline. Reconnect, then choose Download & Load in Models.') }
@@ -233,7 +272,14 @@ export default function App() {
       }, () => Boolean(operation?.cancelled)))
       const engine = session.engine
       engineRef.current = engine; workerRef.current = session.worker
-      await raceCancellation(session.ready)
+      try { await raceCancellation(withDeadline(session.ready, 'Model initialization')) }
+      catch (error) {
+        try { await session.engine.unload() } catch { /* worker termination below is the final cancellation boundary */ }
+        session.worker.terminate()
+        if (engineRef.current === session.engine) engineRef.current = null
+        if (workerRef.current === session.worker) workerRef.current = null
+        throw error
+      }
       const initMs = performance.now() - initStartedAt
       setMetrics((value) => ({ ...value, modelInitMs: initMs, modelSwitchMs: previousEngine ? performance.now() - switchStartedAt : value.modelSwitchMs }))
       setCachedModels((current) => ({ ...current, [modelToLoad]: true }))
@@ -241,7 +287,7 @@ export default function App() {
       setModelLifecycle((current) => ({ ...current, [modelToLoad]: 'verifying' }))
       setModelStatuses((current) => ({ ...current, [modelToLoad]: 'Verifying local inference readiness' }))
       const probeStartedAt = performance.now()
-      const probe = await raceCancellation(engine.chat.completions.create({ messages: [{ role: 'user', content: 'Reply with only OK.' }], temperature: 0, max_tokens: 4, stream: false }))
+      const probe = await raceCancellation(withDeadline(engine.chat.completions.create({ messages: [{ role: 'user', content: 'Reply with only OK.' }], temperature: 0, max_tokens: 4, stream: false }), 'Model readiness check'))
       const readinessProbeMs = performance.now() - probeStartedAt
       if (typeof probe.choices[0]?.message.content !== 'string' || !probe.choices[0].message.content.trim()) throw new Error('Model loaded, but the validation inference returned no text.')
       setMetrics((value) => ({ ...value, readinessProbeMs }))
@@ -257,13 +303,13 @@ export default function App() {
     finally { if (lifecycleRef.current.get(modelToLoad) === trackedInitialization) lifecycleRef.current.delete(modelToLoad) }
   }
 
-  async function loadModel(modelToLoad = selectedModel, fromStartup = false, parentOperation?: ActiveOperation) {
+  async function loadModel(modelToLoad = selectedModel, fromStartup = false, parentOperation?: ActiveOperation, knownCache?: { cached: boolean; runtimeVersion: string; durationMs?: number }) {
     if ((engineRef.current && loadedModelRef.current === modelToLoad && modelReady) || (busy && !parentOperation)) return
     const operation = parentOperation || beginOperation()
     setBusy(true); setStage('loading'); setError(''); setProgress(0); setStatus('Preparing browser runtime...')
     try {
       if (!fromStartup && navigator.storage?.persist) setPersistentStorage(await Promise.race([navigator.storage.persist().then((granted): 'granted' | 'not-granted' => granted ? 'granted' : 'not-granted').catch((): 'not-granted' => 'not-granted'), operation.cancelledPromise]))
-      await ensureModelLoaded(modelToLoad, operation)
+      await ensureModelLoaded(modelToLoad, operation, knownCache)
       setStage('idle'); setStatus('Model ready on this device'); setProgress(100)
       if (navigator.storage?.estimate) {
         const estimate = await navigator.storage.estimate()
@@ -272,9 +318,21 @@ export default function App() {
     } catch (cause) {
       if (operation.cancelled) return
       const message = cause instanceof Error ? cause.message : 'Could not initialize the local model.'
+      const failedEngine = engineRef.current
+      const failedWorker = workerRef.current
+      engineRef.current = null; workerRef.current = null; loadedModelRef.current = ''
+      if (failedEngine) {
+        const shutdown = failedEngine.unload().catch(() => undefined)
+        if (failedWorker) {
+          const shutdownLimit = new Promise<void>((resolve) => window.setTimeout(resolve, 1500))
+          void Promise.race([shutdown, shutdownLimit]).finally(() => failedWorker.terminate())
+        }
+      } else failedWorker?.terminate()
+      setModelReady(false); setLoadedModel('')
       setModelLifecycle((current) => ({ ...current, [modelToLoad]: message.includes('offline') ? 'recoverable-offline-error' : 'failed' }))
       setModelStatuses((current) => ({ ...current, [modelToLoad]: `Needs recovery: ${message}` }))
-      const cache = await checkModelCache(modelToLoad).catch(() => ({ runtimeVersion: 'unknown' })); writeModelRecord(modelRecord(modelToLoad, cache.runtimeVersion, 'error', { error: message }))
+      const cacheVersion = readModelRecords()[modelToLoad]?.runtimeVersion || 'unknown'
+      writeModelRecord(modelRecord(modelToLoad, cacheVersion, 'error', { error: message }))
       setStage('error'); setError(message); setStatus('Model could not be loaded')
     } finally {
       if (!parentOperation && activeOperationRef.current === operation) { setBusy(false); finishOperation(operation) }
@@ -286,8 +344,9 @@ export default function App() {
     if (!prompt || busy) return
     const operation = beginOperation()
     setBusy(true); setStage('loading'); setStatus('Checking the local model cache...')
+    let cacheResult: { cached: boolean; runtimeVersion: string; durationMs?: number } | undefined
     let modelIsCached = Boolean(engineRef.current && loadedModelRef.current === selectedModel)
-    try { if (!modelIsCached) modelIsCached = (await Promise.race([checkModelCache(selectedModel), operation.cancelledPromise])).cached }
+    try { if (!modelIsCached) { cacheResult = await Promise.race([checkModelCache(selectedModel, { signal: operation.controller.signal }), operation.cancelledPromise]); modelIsCached = cacheResult.cached } }
     catch (cause) {
       if (!operation.cancelled) { setShowModels(true); setError(cause instanceof Error ? cause.message : 'Could not inspect the local model cache.'); setStage('error') }
       if (activeOperationRef.current === operation) { setBusy(false); finishOperation(operation) }
@@ -308,7 +367,7 @@ export default function App() {
     setLastRoute(route)
     try {
       setStage('loading'); setStatus('Checking persistent model cache...')
-      const engine = await Promise.race([ensureModelLoaded(selectedModel, operation), operation.cancelledPromise])
+      const engine = await Promise.race([ensureModelLoaded(selectedModel, operation, cacheResult), operation.cancelledPromise])
       setStage('inference'); setStatus(`Running local inference · ${route}`)
       const context = next.slice(-9).map((m) => ({ role: m.role, content: m.content })) as Array<{ role: 'user' | 'assistant'; content: string }>
       const generationStartedAt = performance.now()
@@ -372,10 +431,13 @@ export default function App() {
     try {
       operation = beginOperation()
       setStudioBusy(true); setBusy(true); setStatus('Preparing project generation...')
-      if ((!engineRef.current || loadedModelRef.current !== selectedModel) && !(await Promise.race([checkModelCache(selectedModel), operation.cancelledPromise])).cached) {
+      const cacheResult = (!engineRef.current || loadedModelRef.current !== selectedModel)
+        ? await Promise.race([checkModelCache(selectedModel, { signal: operation.controller.signal }), operation.cancelledPromise])
+        : undefined
+      if (cacheResult && !cacheResult.cached) {
         setShowModels(true); throw new Error('Choose Download & Load in the model manager first; project generation will not trigger a model download unexpectedly.')
       }
-      if (!engineRef.current || loadedModelRef.current !== selectedModel) await loadModel(selectedModel, false, operation)
+      if (!engineRef.current || loadedModelRef.current !== selectedModel) await loadModel(selectedModel, false, operation, cacheResult)
       const engine = engineRef.current
       if (!engine || loadedModelRef.current !== selectedModel) throw new Error('Load a compatible WebGPU model before generating a project.')
       setStudioBusy(true); setBusy(true)
