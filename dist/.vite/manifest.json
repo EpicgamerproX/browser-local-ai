@@ -1,0 +1,29 @@
+{
+  "_react-C8w-UNLI.js": {
+    "file": "assets/react-C8w-UNLI.js",
+    "name": "react"
+  },
+  "index.html": {
+    "file": "assets/index-CxR4tVlp.js",
+    "name": "index",
+    "src": "index.html",
+    "isEntry": true,
+    "imports": [
+      "_react-C8w-UNLI.js"
+    ],
+    "dynamicImports": [
+      "node_modules/@mlc-ai/web-llm/lib/index.js",
+      "node_modules/@mlc-ai/web-llm/lib/index.js",
+      "node_modules/@mlc-ai/web-llm/lib/index.js"
+    ],
+    "css": [
+      "assets/index-B0Ia_44n.css"
+    ]
+  },
+  "node_modules/@mlc-ai/web-llm/lib/index.js": {
+    "file": "assets/webllm-PMFOZltv.js",
+    "name": "webllm",
+    "src": "node_modules/@mlc-ai/web-llm/lib/index.js",
+    "isDynamicEntry": true
+  }
+}
