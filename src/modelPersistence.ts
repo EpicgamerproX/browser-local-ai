@@ -3,7 +3,9 @@ const LOCK_PREFIX = 'local-ai-model-lock-v1:'
 
 export type ModelRecord = { modelId: string; artifactUrl?: string; artifactVersion?: string; runtimeVersion: string; integrity?: string; validation?: string; status: 'downloaded' | 'verified' | 'ready' | 'missing' | 'error'; verifiedAt?: number; updatedAt: number; error?: string }
 export async function checkModelCache(modelId: string): Promise<{ cached: boolean; runtimeVersion: string }> {
-  if (import.meta.env.PROD && 'serviceWorker' in navigator) await navigator.serviceWorker.ready
+  if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+    await Promise.race([navigator.serviceWorker.ready, new Promise<void>((resolve) => window.setTimeout(resolve, 1500))])
+  }
   const runtime = await import('@mlc-ai/web-llm')
   const appConfig = { ...runtime.prebuiltAppConfig, cacheBackend: 'cache' as const }
   const cached = await runtime.hasModelInCache(modelId, appConfig)
@@ -30,13 +32,15 @@ export function writeModelRecord(record: ModelRecord): boolean {
 }
 
 const pause = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms))
-export async function withModelLock<T>(modelId: string, operation: () => Promise<T>): Promise<T> {
+export async function withModelLock<T>(modelId: string, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   const lockName = `${LOCK_PREFIX}${modelId}`
-  if (navigator.locks) return navigator.locks.request(lockName, { mode: 'exclusive' }, operation)
+  if (signal?.aborted) throw new DOMException('Operation aborted.', 'AbortError')
+  if (navigator.locks) return navigator.locks.request(lockName, { mode: 'exclusive', signal }, operation)
   const key = `local-ai-lease:${modelId}`
   const owner = crypto.randomUUID()
   const deadline = Date.now() + 120_000
   while (Date.now() < deadline) {
+    if (signal?.aborted) throw new DOMException('Operation aborted.', 'AbortError')
     try {
       const current = JSON.parse(localStorage.getItem(key) || 'null') as { owner?: string; expiresAt?: number } | null
       if (!current || !current.expiresAt || current.expiresAt < Date.now()) {
@@ -47,6 +51,7 @@ export async function withModelLock<T>(modelId: string, operation: () => Promise
     } catch { return operation() }
     await pause(250)
   }
+  if (signal?.aborted) throw new DOMException('Operation aborted.', 'AbortError')
   if (Date.now() >= deadline) throw new Error('Another tab is currently preparing this model. Close that tab and retry.')
   const heartbeat = window.setInterval(() => {
     try { const current = JSON.parse(localStorage.getItem(key) || 'null') as { owner?: string } | null; if (current?.owner === owner) localStorage.setItem(key, JSON.stringify({ owner, expiresAt: Date.now() + 30_000 })) } catch { /* storage may be unavailable */ }

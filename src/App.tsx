@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import type { MLCEngineInterface } from '@mlc-ai/web-llm'
-import { Activity, ArrowDown, ArrowUp, Cpu, Download, LockKeyhole, Plus, ShieldCheck, Sparkles, Trash2, WifiOff, X } from 'lucide-react'
+import { Activity, ArrowDown, ArrowUp, Cpu, Download, LockKeyhole, Plus, ShieldCheck, Sparkles, StopCircle, Trash2, WifiOff, X } from 'lucide-react'
 import { createZip, downloadBlob, makeEngineeringReport, validateProject, type ArtifactFile, type ArtifactProject } from './artifacts'
 import { checkModelCache, deleteCachedModel, modelRecord, readModelRecords, withModelLock, writeModelRecord } from './modelPersistence'
 import { createLocalEngine } from './localEngine'
@@ -8,6 +8,7 @@ import { createLocalEngine } from './localEngine'
 type Message = { id: string; role: 'user' | 'assistant'; content: string }
 type Stage = 'idle' | 'routing' | 'loading' | 'inference' | 'complete' | 'error'
 type ModelLifecycle = 'uninitialized' | 'checking-cache' | 'download-required' | 'downloading' | 'verifying' | 'initializing' | 'warming-up' | 'ready' | 'switching' | 'failed' | 'recoverable-offline-error'
+type ActiveOperation = { cancelled: boolean; controller: AbortController; cancel: () => void; cancelledPromise: Promise<never> }
 
 const MODEL_ID = 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC'
 const STORAGE_KEY = 'local-ai-chat-v1'
@@ -80,15 +81,18 @@ export default function App() {
   const workerRef = useRef<Worker | null>(null)
   const loadedModelRef = useRef('')
   const lifecycleRef = useRef(new Map<string, Promise<MLCEngineInterface>>())
+  const activeOperationRef = useRef<ActiveOperation | null>(null)
+  const startupCacheCancelledRef = useRef(false)
   const endRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
 
   useEffect(() => {
     setMetrics((value) => ({ ...value, shellReadyMs: Math.round(performance.now()) }))
     let active = true
+    startupCacheCancelledRef.current = false
     void Promise.all([...new Set(MODELS.map((model) => model.id))].map(async (id) => [id, await checkModelCache(id)] as const))
       .then((items) => {
-        if (!active) return
+        if (!active || startupCacheCancelledRef.current) return
         const available = Object.fromEntries(items.map(([id, result]) => [id, result.cached])) as Record<string, boolean>
         setCachedModels(available)
         const records = readModelRecords()
@@ -120,6 +124,48 @@ export default function App() {
     return () => { navigator.serviceWorker?.removeEventListener('controllerchange', updateController); navigator.serviceWorker?.removeEventListener('message', updateMessage); window.removeEventListener('online', updateOnline); window.removeEventListener('offline', updateOnline) }
   }, [])
 
+  function beginOperation(): ActiveOperation {
+    if (activeOperationRef.current) return activeOperationRef.current
+    let rejectCancelled!: (reason: Error) => void
+    const cancelledPromise = new Promise<never>((_, reject) => { rejectCancelled = reject })
+    void cancelledPromise.catch(() => undefined)
+    const operation: ActiveOperation = {
+      cancelled: false,
+      controller: new AbortController(),
+      cancelledPromise,
+      cancel: () => { if (operation.cancelled) return; operation.cancelled = true; operation.controller.abort(); rejectCancelled(new Error('Operation stopped by user.')) },
+    }
+    activeOperationRef.current = operation
+    return operation
+  }
+
+  function finishOperation(operation: ActiveOperation) {
+    if (activeOperationRef.current === operation) activeOperationRef.current = null
+  }
+
+  function stopOperations() {
+    startupCacheCancelledRef.current = true
+    const operation = activeOperationRef.current
+    operation?.cancel()
+    if (operation) finishOperation(operation)
+    const engine = engineRef.current
+    const worker = workerRef.current
+    try { engine?.interruptGenerate() } catch { /* The worker may already have stopped. */ }
+    const unload = engine?.unload().catch(() => undefined) || Promise.resolve()
+    if (worker) {
+      const shutdownLimit = new Promise<void>((resolve) => window.setTimeout(resolve, 1500))
+      void Promise.race([unload, shutdownLimit]).finally(() => worker.terminate())
+    }
+    workerRef.current = null
+    engineRef.current = null
+    loadedModelRef.current = ''
+    lifecycleRef.current.clear()
+    setModelReady(false); setLoadedModel(''); setProgress(0); setBusy(false); setStudioBusy(false)
+    setStage('idle'); setStatus('All AI operations stopped'); setError(''); setStudioError('')
+    setModelLifecycle((current) => ({ ...current, [selectedModel]: 'uninitialized' }))
+    setModelStatuses((current) => ({ ...current, [selectedModel]: 'Stopped by user; cached model files retained' }))
+  }
+
   useEffect(() => {
     let active = true
     void (async () => {
@@ -146,17 +192,21 @@ export default function App() {
   }, [projects])
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, stage])
 
-  async function ensureModelLoaded(modelToLoad: string): Promise<MLCEngineInterface> {
+  async function ensureModelLoaded(modelToLoad: string, operationOverride?: ActiveOperation): Promise<MLCEngineInterface> {
     const inFlight = lifecycleRef.current.get(modelToLoad)
     if (inFlight) return inFlight
+    const operation = operationOverride || activeOperationRef.current
+    const raceCancellation = <T,>(promise: Promise<T>) => operation ? Promise.race([promise, operation.cancelledPromise]) : promise
     const initialization = withModelLock(modelToLoad, async () => {
+      if (operation?.cancelled) throw new Error('Operation stopped by user.')
       if (engineRef.current && loadedModelRef.current === modelToLoad) return engineRef.current
       if (!("gpu" in navigator)) throw new Error('WebGPU is unavailable. No remote fallback is used.')
       const switchStartedAt = performance.now()
       const cacheStartedAt = performance.now()
       setModelLifecycle((current) => ({ ...current, [modelToLoad]: 'checking-cache' }))
       setModelStatuses((current) => ({ ...current, [modelToLoad]: 'Checking persistent cache' }))
-      const cache = await checkModelCache(modelToLoad)
+      setStatus('Checking the local model cache...')
+      const cache = await raceCancellation(checkModelCache(modelToLoad))
       setMetrics((value) => ({ ...value, cacheLookupMs: performance.now() - cacheStartedAt }))
       if (!cache.cached) setModelLifecycle((current) => ({ ...current, [modelToLoad]: 'download-required' }))
       if (!cache.cached && !navigator.onLine) { setModelLifecycle((current) => ({ ...current, [modelToLoad]: 'recoverable-offline-error' })); throw new Error('This model is not cached and the device is offline. Reconnect, then choose Download & Load in Models.') }
@@ -166,18 +216,24 @@ export default function App() {
       if (previousEngine) {
         setModelLifecycle((current) => ({ ...current, [modelToLoad]: 'switching' }))
         setModelStatuses((current) => ({ ...current, [modelToLoad]: 'Switching models ? releasing previous model' }))
-        await previousEngine.unload()
+        await raceCancellation(previousEngine.unload())
         workerRef.current?.terminate()
         workerRef.current = null; engineRef.current = null; loadedModelRef.current = ''
       }
       const initStartedAt = performance.now()
       setModelLifecycle((current) => ({ ...current, [modelToLoad]: 'initializing' }))
-      const session = await createLocalEngine(modelToLoad, (report) => {
+      setStatus('Starting the local model worker...')
+      const session = await raceCancellation(createLocalEngine(modelToLoad, (report) => {
+        if (operation?.cancelled) return
         setProgress(Math.max(0, Math.min(100, Math.round((report.progress ?? 0) * 100))))
         setStatus(report.text || (cache.cached ? 'Initializing cached model...' : 'Downloading model...'))
-      })
+      }, (worker, engine) => {
+        if (operation?.cancelled) { worker.terminate(); return }
+        workerRef.current = worker; engineRef.current = engine
+      }, () => Boolean(operation?.cancelled)))
       const engine = session.engine
       engineRef.current = engine; workerRef.current = session.worker
+      await raceCancellation(session.ready)
       const initMs = performance.now() - initStartedAt
       setMetrics((value) => ({ ...value, modelInitMs: initMs, modelSwitchMs: previousEngine ? performance.now() - switchStartedAt : value.modelSwitchMs }))
       setCachedModels((current) => ({ ...current, [modelToLoad]: true }))
@@ -185,7 +241,7 @@ export default function App() {
       setModelLifecycle((current) => ({ ...current, [modelToLoad]: 'verifying' }))
       setModelStatuses((current) => ({ ...current, [modelToLoad]: 'Verifying local inference readiness' }))
       const probeStartedAt = performance.now()
-      const probe = await engine.chat.completions.create({ messages: [{ role: 'user', content: 'Reply with only OK.' }], temperature: 0, max_tokens: 4, stream: false })
+      const probe = await raceCancellation(engine.chat.completions.create({ messages: [{ role: 'user', content: 'Reply with only OK.' }], temperature: 0, max_tokens: 4, stream: false }))
       const readinessProbeMs = performance.now() - probeStartedAt
       if (typeof probe.choices[0]?.message.content !== 'string' || !probe.choices[0].message.content.trim()) throw new Error('Model loaded, but the validation inference returned no text.')
       setMetrics((value) => ({ ...value, readinessProbeMs }))
@@ -194,40 +250,52 @@ export default function App() {
       setModelStatuses((current) => ({ ...current, [modelToLoad]: 'Ready ? local inference verified' }))
       setLoadedModel(modelToLoad); loadedModelRef.current = modelToLoad; setModelReady(true)
       return engine
-    })
-    lifecycleRef.current.set(modelToLoad, initialization)
-    try { return await initialization }
-    finally { lifecycleRef.current.delete(modelToLoad) }
+    }, operation?.controller.signal)
+    const trackedInitialization = raceCancellation(initialization)
+    lifecycleRef.current.set(modelToLoad, trackedInitialization)
+    try { return await trackedInitialization }
+    finally { if (lifecycleRef.current.get(modelToLoad) === trackedInitialization) lifecycleRef.current.delete(modelToLoad) }
   }
 
-  async function loadModel(modelToLoad = selectedModel, fromStartup = false) {
-    if ((engineRef.current && loadedModelRef.current === modelToLoad && modelReady) || busy) return
+  async function loadModel(modelToLoad = selectedModel, fromStartup = false, parentOperation?: ActiveOperation) {
+    if ((engineRef.current && loadedModelRef.current === modelToLoad && modelReady) || (busy && !parentOperation)) return
+    const operation = parentOperation || beginOperation()
     setBusy(true); setStage('loading'); setError(''); setProgress(0); setStatus('Preparing browser runtime...')
     try {
-      if (!fromStartup && navigator.storage?.persist) setPersistentStorage(await navigator.storage.persist().then((granted) => granted ? 'granted' : 'not-granted').catch(() => 'not-granted'))
-      await ensureModelLoaded(modelToLoad)
+      if (!fromStartup && navigator.storage?.persist) setPersistentStorage(await Promise.race([navigator.storage.persist().then((granted): 'granted' | 'not-granted' => granted ? 'granted' : 'not-granted').catch((): 'not-granted' => 'not-granted'), operation.cancelledPromise]))
+      await ensureModelLoaded(modelToLoad, operation)
       setStage('idle'); setStatus('Model ready on this device'); setProgress(100)
       if (navigator.storage?.estimate) {
         const estimate = await navigator.storage.estimate()
         setStorageEstimate(`${estimate.usage == null ? 'unknown' : `${(estimate.usage / 1_000_000_000).toFixed(2)} GB used`} · ${estimate.quota == null ? 'unknown quota' : `${(estimate.quota / 1_000_000_000).toFixed(2)} GB origin quota`}`)
       }
     } catch (cause) {
+      if (operation.cancelled) return
       const message = cause instanceof Error ? cause.message : 'Could not initialize the local model.'
       setModelLifecycle((current) => ({ ...current, [modelToLoad]: message.includes('offline') ? 'recoverable-offline-error' : 'failed' }))
       setModelStatuses((current) => ({ ...current, [modelToLoad]: `Needs recovery: ${message}` }))
       const cache = await checkModelCache(modelToLoad).catch(() => ({ runtimeVersion: 'unknown' })); writeModelRecord(modelRecord(modelToLoad, cache.runtimeVersion, 'error', { error: message }))
       setStage('error'); setError(message); setStatus('Model could not be loaded')
-    } finally { setBusy(false) }
+    } finally {
+      if (!parentOperation && activeOperationRef.current === operation) { setBusy(false); finishOperation(operation) }
+    }
   }
 
   async function sendMessage() {
     const prompt = input.trim()
     if (!prompt || busy) return
+    const operation = beginOperation()
+    setBusy(true); setStage('loading'); setStatus('Checking the local model cache...')
     let modelIsCached = Boolean(engineRef.current && loadedModelRef.current === selectedModel)
-    try { if (!modelIsCached) modelIsCached = await checkModelCache(selectedModel).then((result) => result.cached) }
-    catch { setShowModels(true); setError('Could not inspect the local model cache. Check browser storage and retry from the model manager.'); return }
+    try { if (!modelIsCached) modelIsCached = (await Promise.race([checkModelCache(selectedModel), operation.cancelledPromise])).cached }
+    catch (cause) {
+      if (!operation.cancelled) { setShowModels(true); setError(cause instanceof Error ? cause.message : 'Could not inspect the local model cache.'); setStage('error') }
+      if (activeOperationRef.current === operation) { setBusy(false); finishOperation(operation) }
+      return
+    }
     if (!modelIsCached) {
       setShowModels(true); setError('Choose Download & Load in the model manager before your first inference. This avoids an unexpected model download.')
+      if (activeOperationRef.current === operation) { setBusy(false); setStage('idle'); finishOperation(operation) }
       return
     }
     setInput(''); setError('')
@@ -240,11 +308,11 @@ export default function App() {
     setLastRoute(route)
     try {
       setStage('loading'); setStatus('Checking persistent model cache...')
-      const engine = await ensureModelLoaded(selectedModel)
+      const engine = await Promise.race([ensureModelLoaded(selectedModel, operation), operation.cancelledPromise])
       setStage('inference'); setStatus(`Running local inference · ${route}`)
       const context = next.slice(-9).map((m) => ({ role: m.role, content: m.content })) as Array<{ role: 'user' | 'assistant'; content: string }>
       const generationStartedAt = performance.now()
-      const stream = await engine.chat.completions.create({
+      const generation = engine.chat.completions.create({
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
           ...context,
@@ -253,11 +321,16 @@ export default function App() {
         max_tokens: 700,
         stream: true,
       })
+      const stream = await Promise.race([generation, operation.cancelledPromise])
       let answer = ''
       let lastCommit = 0
       let firstOutputMs: number | null = null
       let outputChunks = 0
-      for await (const chunk of stream) {
+      const iterator = stream[Symbol.asyncIterator]()
+      while (true) {
+        const next = await Promise.race([iterator.next(), operation.cancelledPromise])
+        if (next.done) break
+        const chunk = next.value
         const content = chunk.choices[0]?.delta?.content || ''
         if (content) { outputChunks += 1; if (firstOutputMs === null) firstOutputMs = performance.now() - generationStartedAt }
         answer += content
@@ -274,10 +347,12 @@ export default function App() {
       setMetrics((value) => ({ ...value, firstOutputMs, outputChunksPerSecond: generationSeconds > 0 ? outputChunks / generationSeconds : null }))
       setStage('complete'); setStatus('Response generated locally')
     } catch (e) {
+      if (!operation.cancelled) {
       const message = e instanceof Error ? e.message : 'Something went wrong during local inference.'
       setError(message); setStage('error'); setStatus('Local inference failed')
+      }
       // Keep any partial response so the user can still read it after a failure.
-    } finally { setBusy(false); inputRef.current?.focus() }
+    } finally { if (activeOperationRef.current === operation) { setBusy(false); finishOperation(operation) }; inputRef.current?.focus() }
   }
 
   function clearChat() {
@@ -293,20 +368,23 @@ export default function App() {
   async function generateProject() {
     if (!studioPrompt.trim() || studioBusy) return
     setStudioError('')
+    let operation: ActiveOperation | null = null
     try {
-      if ((!engineRef.current || loadedModelRef.current !== selectedModel) && !(await checkModelCache(selectedModel).then((result) => result.cached))) {
+      operation = beginOperation()
+      setStudioBusy(true); setBusy(true); setStatus('Preparing project generation...')
+      if ((!engineRef.current || loadedModelRef.current !== selectedModel) && !(await Promise.race([checkModelCache(selectedModel), operation.cancelledPromise])).cached) {
         setShowModels(true); throw new Error('Choose Download & Load in the model manager first; project generation will not trigger a model download unexpectedly.')
       }
-      if (!engineRef.current || loadedModelRef.current !== selectedModel) await loadModel(selectedModel)
+      if (!engineRef.current || loadedModelRef.current !== selectedModel) await loadModel(selectedModel, false, operation)
       const engine = engineRef.current
       if (!engine || loadedModelRef.current !== selectedModel) throw new Error('Load a compatible WebGPU model before generating a project.')
       setStudioBusy(true); setBusy(true)
-      const result = await engine.chat.completions.create({
+      const result = await Promise.race([engine.chat.completions.create({
         messages: [
           { role: 'system', content: 'Return only one JSON object: {"title":"...","files":[{"path":"relative/path.ext","content":"complete text"}]}. Generate a small, complete multi-file student project for the request. Use only text files with supported extensions: html, css, js, ts, py, c, h, cpp, java, ino, json, csv, txt, md, svg, sp, cir, net, ini, toml, yml, yaml. Include a README.md with setup and limitations. Do not use markdown fences or add fields other than title and files.' },
           { role: 'user', content: studioPrompt },
         ], temperature: 0.2, max_tokens: 1400, stream: false,
-      })
+      }), operation.cancelledPromise])
       const text = result.choices[0]?.message.content
       if (typeof text !== 'string') throw new Error('The model returned no project manifest.')
       const parsed: unknown = JSON.parse(text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''))
@@ -315,8 +393,8 @@ export default function App() {
       if (!Array.isArray(manifest.files)) throw new Error('Project manifest is missing its files list.')
       const project = validateProject(typeof manifest.title === 'string' ? manifest.title : studioPrompt.slice(0, 70), manifest.files)
       saveProject(project)
-    } catch (cause) { setStudioError(cause instanceof Error ? cause.message : 'Project generation failed.') }
-    finally { setStudioBusy(false); setBusy(false) }
+    } catch (cause) { if (!operation?.cancelled) setStudioError(cause instanceof Error ? cause.message : 'Project generation failed.') }
+    finally { if (operation && activeOperationRef.current === operation) { setStudioBusy(false); setBusy(false); finishOperation(operation) } }
   }
   function updateActiveFile(content: string) {
     if (!activeProject || !activeFile) return
@@ -347,7 +425,7 @@ export default function App() {
     </aside>
 
     <main className="main-panel">
-      <header className="topbar"><div className="mobile-brand"><Sparkles size={17}/> LOCAL<span>.</span></div><div className="top-meta"><span className="live-pill"><i/> CLIENT-SIDE ONLY</span><span className="model-name">{loadedModel || selectedModel}</span></div><button className="manager-button" onClick={() => setShowModels((value) => !value)}>Models</button><button className="icon-button" title="Clear conversation" onClick={clearChat}><Trash2 size={17}/></button></header>
+      <header className="topbar"><div className="mobile-brand"><Sparkles size={17}/> LOCAL<span>.</span></div><div className="top-meta"><span className="live-pill"><i/> CLIENT-SIDE ONLY</span><span className="model-name">{loadedModel || selectedModel}</span></div><button className="manager-button stop-operations" onClick={stopOperations} disabled={!busy} aria-label={busy ? 'Stop current operation' : 'No operation to stop'}><StopCircle size={15}/> Stop operations</button><button className="manager-button" onClick={() => setShowModels((value) => !value)}>Models</button><button className="icon-button" title="Clear conversation" onClick={clearChat}><Trash2 size={17}/></button></header>
       {showModels && <section className="model-manager"><div className="manager-heading"><div><small>LOCAL MODEL LIBRARY</small><h2>Choose a model</h2><p>Models run on this device. WebLLM uses its persistent Cache API backend. Download estimates are not published in the installed model registry.</p>{appUpdateAvailable && <p className="storage-note">An updated application shell is cached. <button className="manager-button" onClick={() => window.location.reload()}>Reload to update</button></p>}<p className="storage-note">Network: {isOnline ? 'online' : 'offline'} · App shell: {appShellReady ? 'controlled by service worker' : 'not yet controlled'} · Current model: {modelReady && loadedModel === selectedModel ? (appShellReady ? 'ready for offline use' : 'loaded; offline shell not confirmed') : 'not ready'}</p><p className="storage-note">Storage: {persistentStorage}. {storageEstimate}. Browser storage may still be cleared or evicted.</p><p className="storage-note">Measured in this session (state: {modelLifecycle[selectedModel] || 'uninitialized'}): shell interactive {metrics.shellReadyMs} ms after navigation | cache lookup {metrics.cacheLookupMs == null ? 'n/a' : `${metrics.cacheLookupMs.toFixed(0)} ms`} | model initialization {metrics.modelInitMs == null ? 'n/a' : `${(metrics.modelInitMs / 1000).toFixed(1)} s`} | readiness probe {metrics.readinessProbeMs == null ? 'n/a' : `${(metrics.readinessProbeMs / 1000).toFixed(1)} s`} | first output {metrics.firstOutputMs == null ? 'n/a' : `${(metrics.firstOutputMs / 1000).toFixed(2)} s`} | streamed chunks/s {metrics.outputChunksPerSecond == null ? 'n/a' : metrics.outputChunksPerSecond.toFixed(1)} | model switch {metrics.modelSwitchMs == null ? 'n/a' : `${(metrics.modelSwitchMs / 1000).toFixed(1)} s`}. Output chunks/s is not token/s. No pre-change device baseline or network byte trace is available.</p>{persistentStorage === 'not-granted' && <button className="manager-button" onClick={() => { void navigator.storage?.persist().then((granted) => setPersistentStorage(granted ? 'granted' : 'not-granted')) }}>Ask browser to preserve storage</button>}{modelReady && <button className="manager-button" onClick={() => { void engineRef.current?.unload().then(() => { workerRef.current?.terminate(); workerRef.current = null; engineRef.current = null; loadedModelRef.current = ''; setModelReady(false); setLoadedModel(''); setStatus('Model unloaded') }).catch((e: unknown) => setError(e instanceof Error ? e.message : 'Could not unload model.')) }}>Unload current model</button>}</div><button className="icon-button" aria-label="Close model manager" onClick={() => setShowModels(false)}><X size={17}/></button></div>
         {(['Desktop / Laptop', 'Mobile'] as const).map((category) => <div className="model-category" key={category}><h3>{category}</h3><div className="model-grid">{MODELS.filter((model) => model.category === category).map((model, index) => <article className={`model-card ${selectedModel === model.id ? 'selected' : ''}`} key={`${category}-${index}`}><div className="model-card-top"><strong>{model.profile}</strong><span>{cachedModels[model.id] ? (modelStatuses[model.id] || 'CACHED') : 'NOT DOWNLOADED'}</span></div><h4>{model.name}</h4><p>{model.params} parameters · Q4F16 quantization</p><p>{model.recommendation}</p><small>Runtime estimate: {model.memory}. Download size varies; WebLLM reports transfer progress during loading.</small><div className="model-actions"><button onClick={() => { setSelectedModel(model.id); localStorage.setItem(MODEL_STORAGE_KEY, model.id) }}>Select</button><button className="primary-action" disabled={busy || (loadedModel === model.id && modelReady)} onClick={() => { setSelectedModel(model.id); localStorage.setItem(MODEL_STORAGE_KEY, model.id); void loadModel(model.id) }}>{loadedModel === model.id && modelReady ? 'Loaded' : cachedModels[model.id] ? 'Load model' : 'Download & load'}</button>{cachedModels[model.id] && <button disabled={busy || loadedModel === model.id} onClick={() => { void removeCachedModel(model.id) }}>Delete cache</button>}</div></article>)}</div></div>)}
         <p className="storage-note">Cache is managed by WebLLM. Browser storage may be cleared or evicted. Mobile Balanced and Enhanced currently share the same verified 1.5B artifact.</p>
@@ -367,7 +445,7 @@ export default function App() {
           <div className="feature-grid"><button onClick={() => setInput('Explain how a browser can run a language model locally.') }><span className="feature-icon"><Cpu size={17}/></span><strong>On-device inference</strong><small>No remote AI API</small><ArrowDown size={14}/></button><button onClick={() => setInput('Design a simple step-by-step pipeline for a small AI model.') }><span className="feature-icon"><Activity size={17}/></span><strong>Pipeline thinking</strong><small>Route → infer → respond</small><ArrowDown size={14}/></button><button onClick={() => setInput('What are the limitations of running a small AI model in a browser?') }><span className="feature-icon"><ShieldCheck size={17}/></span><strong>Private by design</strong><small>Local conversation history</small><ArrowDown size={14}/></button></div>
           <div className="model-notice"><WifiOff size={16}/><span><strong>First launch requires a download.</strong> The model is fetched once and cached by the runtime when supported. Subsequent launches should be faster.</span></div>
         </div> : <div className="messages">{messages.map((m, i) => m.role === 'assistant' && !m.content && busy && i === messages.length - 1 ? <article className="message assistant" key={m.id}><div className="message-avatar"><Sparkles size={16}/></div><div className="message-body"><div className="message-role">LOCAL / AI</div><div className="message-content"><span className="typing"><i/><i/><i/></span></div></div></article> : <MessageItem key={m.id} message={m} />)}</div>}
-        {stage === 'loading' && <div className="load-panel"><div className="load-heading"><Download size={16}/><strong>Preparing local model</strong><span>{progress}%</span></div><div className="progress-track"><div style={{ width: `${progress}%` }}/></div><p>{status}</p><small>Keep this tab open. The initial download may take a while and uses your internet connection.</small></div>}
+        {stage === 'loading' && <div className="load-panel"><div className="load-heading"><Download size={16}/><strong>Preparing local model</strong><span>{progress}%</span></div><div className="progress-track"><div style={{ width: `${progress}%` }}/></div><p>{status}</p><small>Keep this tab open. The initial download may take a while and uses your internet connection.</small><button className="manager-button stop-operations load-stop-button" onClick={stopOperations}><StopCircle size={15}/> Stop operations</button></div>}
         {error && <div className="error-panel"><strong>Couldn't run the local model</strong><p>{error}</p><button onClick={() => { setError(''); setStage('idle') }}>Dismiss</button></div>}
         <div ref={endRef}/>
       </section>

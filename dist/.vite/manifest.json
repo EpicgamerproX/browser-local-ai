@@ -4,7 +4,7 @@
     "name": "react"
   },
   "index.html": {
-    "file": "assets/index-CxR4tVlp.js",
+    "file": "assets/index-MEhU-OqZ.js",
     "name": "index",
     "src": "index.html",
     "isEntry": true,
@@ -17,7 +17,7 @@
       "node_modules/@mlc-ai/web-llm/lib/index.js"
     ],
     "css": [
-      "assets/index-B0Ia_44n.css"
+      "assets/index-Ct9OXyow.css"
     ]
   },
   "node_modules/@mlc-ai/web-llm/lib/index.js": {
